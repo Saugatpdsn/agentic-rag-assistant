@@ -1,33 +1,35 @@
-"""ChatOpenAI factories. gpt-5 series only — gpt-4* chat models are forbidden."""
+"""ChatGoogleGenerativeAI (Gemini) factories.
+
+Thinking is explicitly turned off (thinking_budget=0). Gemini's thinking
+models attach a thought_signature to function-call parts and require it to
+be echoed back on every step of a tool-calling turn; langchain-google-genai
+doesn't yet do this reliably through LangGraph's tool loop, which surfaces
+as a 400 "missing thought_signature" error (see
+https://github.com/langchain-ai/langchain-google/issues/1364). With
+thinking disabled, no signature is ever generated, so there's nothing to
+drop — this sidesteps the bug entirely rather than working around it.
+"""
 
 from __future__ import annotations
 
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 from rag_agent.config import settings
 
 
-def _assert_gpt5(model: str) -> None:
-    if model.startswith(("gpt-4", "gpt-3")):
-        raise ValueError(
-            f"Refusing to use obsolete chat model {model!r}; use the gpt-5 series."
-        )
-
-
-def fast_model() -> ChatOpenAI:
+def fast_model() -> ChatGoogleGenerativeAI:
     """Small, cheap model for routine steps."""
-    _assert_gpt5(settings.model_fast)
-    return ChatOpenAI(model=settings.model_fast, streaming=True)
+    return ChatGoogleGenerativeAI(
+        model=settings.model_fast,
+        google_api_key=settings.google_api_key,
+        thinking_budget=0,
+    )
 
 
-def heavy_model() -> ChatOpenAI:
-    """Capable reasoning model for planning + answer synthesis.
-
-    Passing ``reasoning`` makes langchain-openai route through the Responses API.
-    """
-    _assert_gpt5(settings.model_heavy)
-    return ChatOpenAI(
+def heavy_model() -> ChatGoogleGenerativeAI:
+    """Capable reasoning model for planning + answer synthesis."""
+    return ChatGoogleGenerativeAI(
         model=settings.model_heavy,
-        streaming=True,
-        reasoning={"effort": settings.reasoning_effort},
+        google_api_key=settings.google_api_key,
+        thinking_budget=0,
     )

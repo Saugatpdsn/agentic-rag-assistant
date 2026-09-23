@@ -22,14 +22,16 @@ map, in order, to the specific sources you actually used. If you could not find
 relevant evidence, say so honestly rather than guessing."""
 
 
-def build_agent(checkpointer=None):
+def build_agent(model=None, checkpointer=None):
     """Return a compiled LangGraph agent.
 
     The returned graph is automatically traced by LangSmith (via env) and
-    streamable through ``astream(stream_mode=[...])``.
+    streamable through ``astream(stream_mode=[...])``. Pass an explicit
+    ``model`` to build a fallback agent (e.g. on a different Gemini model)
+    that shares the same ``checkpointer``/conversation history.
     """
     return create_agent(
-        model=heavy_model(),
+        model=model or heavy_model(),
         tools=build_tools(),
         system_prompt=SYSTEM_PROMPT,
         checkpointer=checkpointer,

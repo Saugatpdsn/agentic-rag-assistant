@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     )
 
     # --- credentials ---
-    openai_api_key: str
+    google_api_key: str
     tavily_api_key: str | None = None
 
     # --- LangSmith (tracing auto-enables when LANGSMITH_TRACING=true + key set) ---
@@ -28,16 +28,21 @@ class Settings(BaseSettings):
     langsmith_project: str = "resume-demo-rag-agent"
     langsmith_endpoint: str = "https://api.smith.langchain.com"
 
-    # --- models (gpt-5 series only; never gpt-4*) ---
-    model_fast: str = "gpt-5.4-mini"
-    model_heavy: str = "gpt-5.5"
-    embedding_model: str = "text-embedding-3-small"
-    reasoning_effort: str = "medium"
+    # --- models (Gemini) ---
+    # NOTE: gemini-3.x "thinking" models require echoing a thought_signature on
+    # every tool-call step, and langchain-google-genai doesn't yet do this
+    # reliably through LangGraph's tool-calling loop (400 "missing
+    # thought_signature" errors — see langchain-ai/langchain-google#1364).
+    # Gemini 2.5 doesn't have this strict requirement, so it's the safe choice
+    # for the agent until that's fixed. Still covered by the free tier;
+    # stable until the Gemini 2.5 shutdown on 16 Oct 2026.
+    model_fast: str = "gemini-2.5-flash-lite"
+    model_heavy: str = "gemini-2.5-flash"
+    embedding_model: str = "models/gemini-embedding-001"
 
     # --- storage / retrieval ---
     chroma_dir: str = "./chroma_db"
     chroma_collection: str = "documents"
-    sqlite_path: str = "./memory.sqlite"
     retriever_k: int = 4
     sample_docs_dir: str = "./data/sample_docs"
 
