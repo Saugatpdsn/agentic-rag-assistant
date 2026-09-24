@@ -25,3 +25,16 @@ def collection_count() -> int:
         return get_vectorstore()._collection.count()
     except Exception:
         return 0
+
+
+def list_sources() -> list[tuple[str, int]]:
+    """Distinct ingested filenames with their chunk counts, sorted by name."""
+    try:
+        data = get_vectorstore()._collection.get(include=["metadatas"])
+    except Exception:
+        return []
+    counts: dict[str, int] = {}
+    for md in data.get("metadatas", []) or []:
+        name = (md or {}).get("source", "unknown")
+        counts[name] = counts.get(name, 0) + 1
+    return sorted(counts.items())
