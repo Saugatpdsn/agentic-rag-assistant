@@ -11,12 +11,12 @@ backend/API. Run it from the project root so relative paths in config.py
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sys
 import tempfile
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 import streamlit as st
 
@@ -32,7 +32,7 @@ from rag_agent.agent import build_agent  # noqa: E402
 from rag_agent.config import settings  # noqa: E402
 from rag_agent.ingest import ensure_seeded, ingest_paths  # noqa: E402
 from rag_agent.llms import fast_model, heavy_model  # noqa: E402
-from rag_agent.vectorstore import collection_count  # noqa: E402
+from rag_agent.vectorstore import collection_count, list_sources  # noqa: E402
 
 try:
     from langgraph.checkpoint.memory import InMemorySaver as _Saver
@@ -40,6 +40,39 @@ except ImportError:  # older langgraph versions
     from langgraph.checkpoint.memory import MemorySaver as _Saver
 
 st.set_page_config(page_title="Agentic RAG Assistant", page_icon="🧠", layout="wide")
+
+# Tool name -> (icon, human label), used for the little badges under each
+# assistant reply and while a turn is streaming.
+TOOL_LABELS = {
+    "retrieve_documents": ("📄", "Document Search"),
+    "web_search": ("🌐", "Web Search"),
+}
+
+
+def tool_badge(tool_name: str) -> str:
+    icon, label = TOOL_LABELS.get(tool_name, ("🔧", tool_name))
+    return f"{icon} {label}"
+
+
+st.markdown(
+    """
+<style>
+.source-card {
+    border: 1px solid rgba(128,128,128,0.25);
+    border-radius: 10px;
+    padding: 10px 14px;
+    margin-bottom: 8px;
+}
+.source-card .src-title { font-weight: 600; font-size: 0.92rem; }
+.source-card .src-snippet {
+    font-size: 0.85rem; opacity: 0.8; margin-top: 4px;
+    white-space: pre-wrap;
+}
+.tool-badges { opacity: 0.75; font-size: 0.82rem; margin-bottom: 2px; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 
 # --------------------------------------------------------------------------
@@ -51,10 +84,9 @@ def get_agents():
     """Build a primary + fallback agent that share one checkpointer (so
     conversation history carries over if a turn has to fall back).
 
-    503 "model overloaded" is a per-model shared-capacity issue, not
-    per-key — so on repeated overload, retrying the SAME model rarely
-    helps, but switching to a DIFFERENT free-tier model usually does,
-    since it draws from a separate serving pool.
+    503 "model overloaded" / 429 "quota exceeded" are per-model pools, not
+    per-key — so on repeated failure, retrying the SAME model rarely helps,
+    but switching to a DIFFERENT free-tier model usually does.
     """
     ensure_seeded()  # auto-ingest sample docs on first boot if empty
     checkpointer = _Saver()
@@ -73,12 +105,11 @@ primary_agent, fallback_agent = get_agents()
 # across turns (via run_until_complete instead of asyncio.run) avoids that.
 @st.cache_resource(show_spinner=False)
 def get_event_loop() -> asyncio.AbstractEventLoop:
-    loop = asyncio.new_event_loop()
-    return loop
+    return asyncio.new_event_loop()
 
 
 def _init_state() -> None:
-    st.session_state.setdefault("messages", [])  # [{role, content, sources}]
+    st.session_state.setdefault("messages", [])  # [{role, content, sources, tools_used}]
     st.session_state.setdefault("thread_id", str(uuid.uuid4()))
 
 
@@ -86,9 +117,11 @@ _init_state()
 
 
 # --------------------------------------------------------------------------
-# Agent driver — mirrors the old SSE event stream, but yields locally
+# Agent driver
 # --------------------------------------------------------------------------
 def _result_preview(content, limit: int = 300) -> str:
+    import json
+
     text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
     return text[:limit]
 
@@ -134,17 +167,31 @@ async def _run_turn(agent, message: str, thread_id: str, on_event) -> None:
 
 
 _TRANSIENT_MARKERS = ("503", "overloaded", "unavailable", "high demand")
+_RATE_LIMIT_MARKERS = ("429", "quota exceeded", "resource exhausted", "resource_exhausted")
+_DAILY_QUOTA_MARKERS = ("perday", "requests per day", "generaterequestsperdayperprojectpermodel")
 
 
 def _is_transient(exc: Exception) -> bool:
     return any(m in str(exc).lower() for m in _TRANSIENT_MARKERS)
 
 
+def _is_rate_limited(exc: Exception) -> bool:
+    return any(m in str(exc).lower() for m in _RATE_LIMIT_MARKERS)
+
+
+def _is_daily_quota_exhausted(exc: Exception) -> bool:
+    """A per-day free-tier quota won't recover within this session — retrying
+    the same model is pointless until it resets (~midnight Pacific)."""
+    return any(m in str(exc).lower() for m in _DAILY_QUOTA_MARKERS)
+
+
 def run_turn_sync(
     message: str, thread_id: str, on_event, on_retry=None, on_fallback=None, max_attempts: int = 2
 ) -> None:
-    """Run one turn against the primary model; on repeated overload (503),
-    fall back to a different free-tier model (separate serving pool) before
+    """Run one turn against the primary model; on overload (503) or a
+    per-minute rate limit (429), retry with backoff. On a per-day quota
+    exhaustion, or repeated overload/rate-limiting, fall back immediately to
+    a different free-tier model (separate quota + capacity pool) before
     giving up. Real errors (bad request, auth, etc.) are never retried.
     """
     import time
@@ -159,24 +206,74 @@ def run_turn_sync(
             return
         except Exception as exc:
             last_exc = exc
-            if not _is_transient(exc):
+            if _is_daily_quota_exhausted(exc):
+                break  # no point retrying the same model today
+            if not (_is_transient(exc) or _is_rate_limited(exc)):
                 raise
             if attempt < max_attempts:
                 if on_retry:
                     on_retry(attempt, max_attempts)
                 time.sleep(min(2**attempt, 8))  # 2s, 4s, ...
 
-    # Primary model is consistently overloaded — try the fallback model,
-    # which draws from a different capacity pool and shares conversation
-    # history via the same checkpointer.
+    # Primary model is out of capacity or quota for now — try the fallback
+    # model, which has its own separate capacity + daily quota pool, and
+    # shares conversation history via the same checkpointer.
     if on_fallback:
         on_fallback()
     try:
         loop.run_until_complete(_run_turn(fallback_agent, message, thread_id, on_event))
     except Exception as exc:
-        if _is_transient(exc):
-            raise last_exc from exc  # both pools overloaded — surface the original message
+        if _is_transient(exc) or _is_rate_limited(exc):
+            raise last_exc from exc  # both pools exhausted/overloaded — surface the original message
         raise
+
+
+# --------------------------------------------------------------------------
+# Rendering helpers
+# --------------------------------------------------------------------------
+def render_tool_badges(tools_used: list[str]) -> None:
+    if not tools_used:
+        st.markdown('<div class="tool-badges">💭 Answered directly — no tools used</div>', unsafe_allow_html=True)
+        return
+    badges = " &nbsp;·&nbsp; ".join(tool_badge(t) for t in tools_used)
+    st.markdown(f'<div class="tool-badges">{badges}</div>', unsafe_allow_html=True)
+
+
+def render_sources(sources: list[dict]) -> None:
+    if not sources:
+        return
+    docs = [s for s in sources if s.get("kind") == "document"]
+    web = [s for s in sources if s.get("kind") == "web"]
+
+    with st.expander(f"📚 Sources ({len(sources)})", expanded=False):
+        if docs:
+            st.caption(f"From your documents ({len(docs)})")
+            for s in docs:
+                snippet = (s.get("snippet") or "").strip().replace("\n", " ")
+                st.markdown(
+                    f"""<div class="source-card">
+<div class="src-title">📄 {s.get('title', 'document')}</div>
+<div class="src-snippet">{snippet}</div>
+</div>""",
+                    unsafe_allow_html=True,
+                )
+        if web:
+            if docs:
+                st.divider()
+            st.caption(f"From the web ({len(web)})")
+            for s in web:
+                title = s.get("title", "result")
+                url = s.get("url")
+                domain = urlparse(url).netloc if url else ""
+                snippet = (s.get("snippet") or "").strip().replace("\n", " ")
+                title_html = f'<a href="{url}" target="_blank">{title}</a>' if url else title
+                st.markdown(
+                    f"""<div class="source-card">
+<div class="src-title">🌐 {title_html} {f'<span style="opacity:.6;font-weight:400;">({domain})</span>' if domain else ''}</div>
+<div class="src-snippet">{snippet}</div>
+</div>""",
+                    unsafe_allow_html=True,
+                )
 
 
 # --------------------------------------------------------------------------
@@ -184,37 +281,53 @@ def run_turn_sync(
 # --------------------------------------------------------------------------
 with st.sidebar:
     st.title("🧠 Agentic RAG")
-    st.markdown(
-        f"""
-- **Fast model:** `{settings.model_fast}` (also used as overload fallback)
+    st.caption("An agent that decides, per question, whether to search your documents, search the web, or answer directly.")
+
+    with st.expander("⚙️ Models & settings", expanded=False):
+        st.markdown(
+            f"""
 - **Heavy model:** `{settings.model_heavy}`
+- **Fallback model:** `{settings.model_fast}`
 - **Embeddings:** `{settings.embedding_model}`
 - **Web search:** `{settings.web_backend}`
-- **Docs indexed:** `{collection_count()}`
 """
-    )
+        )
 
     st.divider()
-    st.subheader("Upload documents")
-    uploaded = st.file_uploader(
-        "PDF / TXT / MD files to add to the knowledge base",
-        accept_multiple_files=True,
-    )
-    if st.button("Ingest", disabled=not uploaded, use_container_width=True):
-        with st.spinner("Ingesting..."):
-            tmp_paths = []
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                for f in uploaded:
-                    p = os.path.join(tmp_dir, f.name)
-                    with open(p, "wb") as out:
-                        out.write(f.getvalue())
-                    tmp_paths.append(p)
-                added = ingest_paths(tmp_paths)
-        st.success(f"Added {added} chunks from {len(uploaded)} file(s).")
-        st.rerun()
+    st.subheader("📚 Knowledge base")
+    sources_list = list_sources()
+    total_chunks = collection_count()
+    c1, c2 = st.columns(2)
+    c1.metric("Documents", len(sources_list))
+    c2.metric("Chunks", total_chunks)
+
+    if sources_list:
+        for name, count in sources_list:
+            st.markdown(f"📄 **{name}** &nbsp;·&nbsp; {count} chunk{'s' if count != 1 else ''}", unsafe_allow_html=True)
+    else:
+        st.caption("No documents indexed yet.")
+
+    with st.expander("➕ Add documents", expanded=not sources_list):
+        uploaded = st.file_uploader(
+            "PDF / TXT / MD files",
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+        )
+        if st.button("Ingest", disabled=not uploaded, use_container_width=True):
+            with st.spinner("Ingesting..."):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    tmp_paths = []
+                    for f in uploaded:
+                        p = os.path.join(tmp_dir, f.name)
+                        with open(p, "wb") as out:
+                            out.write(f.getvalue())
+                        tmp_paths.append(p)
+                    added = ingest_paths(tmp_paths)
+            st.success(f"Added/updated {added} chunks from {len(uploaded)} file(s).")
+            st.rerun()
 
     st.divider()
-    if st.button("New conversation", use_container_width=True):
+    if st.button("🗑️ New conversation", use_container_width=True):
         st.session_state["messages"] = []
         st.session_state["thread_id"] = str(uuid.uuid4())
         st.rerun()
@@ -227,11 +340,10 @@ st.title("Chat with your documents")
 
 for msg in st.session_state["messages"]:
     with st.chat_message(msg["role"]):
+        if msg["role"] == "assistant":
+            render_tool_badges(msg.get("tools_used", []))
         st.markdown(msg["content"])
-        if msg.get("sources"):
-            with st.expander(f"Sources ({len(msg['sources'])})"):
-                for src in msg["sources"]:
-                    st.markdown(f"- {src}")
+        render_sources(msg.get("sources", []))
 
 # --------------------------------------------------------------------------
 # Chat input
@@ -239,62 +351,86 @@ for msg in st.session_state["messages"]:
 prompt = st.chat_input("Ask a question about your documents or the web...")
 
 if prompt:
-    st.session_state["messages"].append({"role": "user", "content": prompt})
+    st.session_state["messages"].append({"role": "user", "content": prompt, "sources": [], "tools_used": []})
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
+        badge_placeholder = st.empty()
         text_placeholder = st.empty()
         tool_status = st.empty()
-        state = {"accumulated": "", "sources": [], "error": None}
+        state = {"accumulated": "", "sources": [], "tools_used": [], "error": None}
 
         def on_event(kind: str, data: dict) -> None:
             if kind == "tool_start":
-                tool_status.info(f"🔧 Using tool: `{data.get('tool', '')}`")
+                name = data.get("tool", "")
+                if name not in state["tools_used"]:
+                    state["tools_used"].append(name)
+                tool_status.markdown(f"⏳ Using **{tool_badge(name)}**...")
             elif kind == "tool_end":
                 ok = data.get("ok", True)
-                tool_status.info(f"{'✅' if ok else '⚠️'} `{data.get('tool', '')}` finished")
+                tool_status.markdown(f"{'✅' if ok else '⚠️'} {tool_badge(data.get('tool', ''))} finished")
             elif kind == "token":
                 state["accumulated"] += data.get("delta", "")
                 text_placeholder.markdown(state["accumulated"] + "▌")
             elif kind == "sources":
                 for s in data.get("sources", []):
-                    label = s if isinstance(s, str) else json.dumps(s, ensure_ascii=False)
-                    if label not in state["sources"]:
-                        state["sources"].append(label)
+                    if s not in state["sources"]:
+                        state["sources"].append(s)
 
         def on_retry(attempt: int, max_attempts: int) -> None:
             # Google's servers are momentarily overloaded — reset any partial
             # output and try again rather than surfacing a scary error.
             state["accumulated"] = ""
             state["sources"] = []
+            state["tools_used"] = []
             text_placeholder.empty()
             tool_status.warning(f"⏳ Gemini is busy, retrying... ({attempt}/{max_attempts - 1})")
 
         def on_fallback() -> None:
             state["accumulated"] = ""
             state["sources"] = []
+            state["tools_used"] = []
             text_placeholder.empty()
             tool_status.warning(f"🔁 Switching to `{settings.model_fast}` (different capacity pool)...")
 
         try:
             run_turn_sync(prompt, st.session_state["thread_id"], on_event, on_retry=on_retry, on_fallback=on_fallback)
         except Exception as exc:  # keep the UI usable even if a turn fails
-            msg = str(exc)
-            if any(m in msg.lower() for m in ("503", "overloaded", "unavailable", "high demand")):
+            msg_text = str(exc)
+            low = msg_text.lower()
+            if "perday" in low or "requests per day" in low:
+                state["error"] = (
+                    "You've hit today's free-tier daily request limit for both models. "
+                    "It resets at midnight Pacific time — try again then, or add billing "
+                    "to your Google AI Studio project for higher limits."
+                )
+            elif any(m in low for m in ("429", "quota exceeded", "resource exhausted")):
+                state["error"] = "Gemini's free-tier rate limit was hit on both models. Please wait a minute and try again."
+            elif any(m in low for m in ("503", "overloaded", "unavailable", "high demand")):
                 state["error"] = "Gemini is overloaded on every available free-tier model right now. Please try again in a minute."
             else:
-                state["error"] = msg
+                state["error"] = msg_text
 
         tool_status.empty()
+        badge_placeholder.markdown(
+            '<div class="tool-badges">💭 Answered directly — no tools used</div>'
+            if not state["tools_used"]
+            else '<div class="tool-badges">'
+            + " &nbsp;·&nbsp; ".join(tool_badge(t) for t in state["tools_used"])
+            + "</div>",
+            unsafe_allow_html=True,
+        )
         text_placeholder.markdown(state["accumulated"] or "_(no response)_")
         if state["error"]:
             st.error(state["error"])
-        if state["sources"]:
-            with st.expander(f"Sources ({len(state['sources'])})"):
-                for src in state["sources"]:
-                    st.markdown(f"- {src}")
+        render_sources(state["sources"])
 
     st.session_state["messages"].append(
-        {"role": "assistant", "content": state["accumulated"], "sources": state["sources"]}
+        {
+            "role": "assistant",
+            "content": state["accumulated"],
+            "sources": state["sources"],
+            "tools_used": state["tools_used"],
+        }
     )
