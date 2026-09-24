@@ -1,4 +1,5 @@
 # Aurora — Frequently Asked Questions
+# This is the frictional document
 
 **Q: What is the maximum event size Aurora accepts?**
 256 KB. Larger events are rejected at the ingest tier with a 413 error.
